@@ -55,8 +55,22 @@ mkdir -p "$SESSION_DIR"
 SESSION_JSON="$SESSION_DIR/$RUN_ID.json"
 SESSION_MD="$SESSION_DIR/$RUN_ID.md"
 
+log "add dotnet plugins"
+
+# Add the marketplace once
+claude plugin marketplace add dotnet/skills
+
+# Install plugins
+claude plugin install dotnet@dotnet-agent-skills
+claude plugin install dotnet-data@dotnet-agent-skills
+claude plugin install dotnet-msbuild@dotnet-agent-skills
+claude plugin install dotnet-ai@dotnet-agent-skills
+claude plugin install dotnet-test@dotnet-agent-skills
+claude plugin install dotnet-aspnet@dotnet-agent-skills
+
 log "Running Claude Code task..."
 log "Session will be saved to /sessions/$RUN_ID.json"
+
 
 # Run Claude Code — capture full stream-json output as the session record
 claude -p "$TASK" \

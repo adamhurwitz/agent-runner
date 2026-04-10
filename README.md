@@ -57,6 +57,15 @@ docker run --rm \
   agent-runner
 ```
 
+## Use The Agent Skill 
+
+This repository also includes a reusable skill for using Agent Runner from your coding assistant to create workflows:
+
+- `.claude/skills/agent-runner/SKILL.md`
+
+This allows for an agent to orchestrate the use of this agent-runner. 
+
+
 ## Included Toolchain
 
 - **Node.js 22** — Claude Code runtime
