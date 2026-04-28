@@ -18,10 +18,13 @@ The main use case for this project is when you have a Plan and specs defined for
 There is a container image that contains base packages and runs a shell script which manages execution. 
 
 1. The container clones the repo and creates a task branch
-2. Claude Code executes the given task with file read/write/edit and bash tools
-3. A local logs directory is mapped into the container so you can review what happened locally.
-4. A session transcript (JSON) and human-readable summary (Markdown) are saved to a local sessions directory mapped into the container.
-5. All changes are committed and pushed to the task branch
+2. The container builds an effective task prompt from a reusable template plus the user task
+3. If issue environment variables are provided, the container uses an issue-specific template
+4. Claude Code executes the task and handles commit, push, and PR creation
+5. Pull requests are created through the GitHub MCP server configured in the container
+6. A GitHub MCP preflight check verifies Claude can use the configured GitHub MCP tools before the full task starts
+7. A local logs directory is mapped into the container so you can review what happened locally.
+8. A session transcript (JSON) and human-readable summary (Markdown) are saved to a local sessions directory mapped into the container.
 
 
 
@@ -41,6 +44,8 @@ There is a container image that contains base packages and runs a shell script w
 | `BRANCH_NAME` | `claude/task-<timestamp>` | Branch name for the changes |
 | `GIT_EMAIL` | `claude@example.com` | Git commit email |
 | `GIT_NAME` | `Claude Code` | Git commit author name |
+| `ISSUE_NUMBER` | (empty) | Issue number to enable issue-mode effective task template |
+| `ISSUE_URL` | (empty) | Issue URL to enable issue-mode effective task template |
 
 ## Usage
 
@@ -56,6 +61,13 @@ docker run --rm \
   -v ./sessions:/sessions \
   agent-runner
 ```
+
+## Claude Permissions
+
+The image includes a Claude settings file at `claude-settings.json` that allowlists GitHub MCP tools for the run via `permissions.allow`.
+
+Before the main task starts, the runner performs a lightweight GitHub MCP preflight using `mcp__github__get_me`.
+If Claude tool permissions or GitHub authentication are not working, the run fails early and records the preflight transcript in `sessions/<run-id>-preflight.json`.
 
 ## Use The Agent Skill 
 

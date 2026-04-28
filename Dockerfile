@@ -31,6 +31,9 @@ RUN mkdir -p /logs /sessions
 WORKDIR /repo
 
 COPY entrypoint.sh /entrypoint.sh
+COPY claude-settings.json /claude-settings.json
+COPY task-template.md /task-template.md
+COPY task-template-issue.md /task-template-issue.md
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

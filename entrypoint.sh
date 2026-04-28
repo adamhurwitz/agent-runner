@@ -16,6 +16,8 @@ log() {
 : "${TASK:?TASK is required}"
 
 BRANCH_NAME="${BRANCH_NAME:-claude/task-$(date +%s)}"
+ISSUE_NUMBER="${ISSUE_NUMBER:-}"
+ISSUE_URL="${ISSUE_URL:-}"
 
 log "=== Claude Code Task Runner ==="
 log "Repo:   $REPO"s
@@ -54,6 +56,37 @@ mkdir -p "$SESSION_DIR"
 
 SESSION_JSON="$SESSION_DIR/$RUN_ID.json"
 SESSION_MD="$SESSION_DIR/$RUN_ID.md"
+CLAUDE_SETTINGS_FILE="/claude-settings.json"
+CLAUDE_ALLOWED_TOOLS="Read,Write,Edit,Bash,mcp__github__*"
+
+log "Configuring GitHub MCP server..."
+# Build MCP JSON safely from runtime environment rather than parsing a .env file.
+GITHUB_MCP_CONFIG=$(jq -cn --arg token "$GITHUB_TOKEN" '{type:"http",url:"https://api.githubcopilot.com/mcp",headers:{Authorization:("Bearer " + $token)}}')
+claude mcp remove github >/dev/null 2>&1 || true
+claude mcp add-json github "$GITHUB_MCP_CONFIG" 2>&1 | tee -a "$LOG_FILE"
+
+log "Running GitHub MCP preflight check..."
+PREFLIGHT_JSON="$SESSION_DIR/$RUN_ID-preflight.json"
+claude -p "Call the GitHub MCP tool mcp__github__get_me exactly once. After the tool responds, output exactly one line in this format with no other text: GITHUB_LOGIN=<the login value from the response>. If the tool call fails or is denied, output: GITHUB_LOGIN=ERROR" \
+  --settings "$CLAUDE_SETTINGS_FILE" \
+  --allowedTools "$CLAUDE_ALLOWED_TOOLS" \
+  --permission-mode dontAsk \
+  --output-format stream-json \
+  --verbose \
+  2>&1 | tee "$PREFLIGHT_JSON" | tee -a "$LOG_FILE"
+
+PREFLIGHT_RESULT=$(grep '"type":"result"' "$PREFLIGHT_JSON" | tail -1 || echo '{}')
+PREFLIGHT_RESULT_TEXT=$(echo "$PREFLIGHT_RESULT" | jq -r '.result // ""' 2>/dev/null || echo "")
+PREFLIGHT_LOGIN=$(echo "$PREFLIGHT_RESULT_TEXT" | grep -oP '(?<=GITHUB_LOGIN=)\S+' || true)
+
+if [ -z "$PREFLIGHT_LOGIN" ] || [ "$PREFLIGHT_LOGIN" = "ERROR" ]; then
+  log "ERROR: GitHub MCP preflight did not confirm authenticated access."
+  log "Result text: $PREFLIGHT_RESULT_TEXT"
+  log "See $PREFLIGHT_JSON for details."
+  exit 1
+fi
+
+log "GitHub MCP preflight succeeded for login: $PREFLIGHT_LOGIN"
 
 log "add dotnet plugins"
 
@@ -68,13 +101,57 @@ claude plugin install dotnet-ai@dotnet-agent-skills
 claude plugin install dotnet-test@dotnet-agent-skills
 claude plugin install dotnet-aspnet@dotnet-agent-skills
 
+log "Building effective task prompt from template..."
+TEMPLATE_FILE="/task-template.md"
+ISSUE_REFERENCE=""
+if [ -n "$ISSUE_NUMBER" ] || [ -n "$ISSUE_URL" ]; then
+  TEMPLATE_FILE="/task-template-issue.md"
+  if [ -n "$ISSUE_NUMBER" ]; then
+    ISSUE_REFERENCE="#$ISSUE_NUMBER"
+  else
+    ISSUE_REFERENCE="$ISSUE_URL"
+  fi
+  log "Using issue-mode template ($TEMPLATE_FILE)"
+else
+  log "Using standard template ($TEMPLATE_FILE)"
+fi
+
+EFFECTIVE_TASK=$(awk \
+  -v repo="$REPO" \
+  -v branch="$BRANCH_NAME" \
+  -v run_id="$RUN_ID" \
+  -v user_task="$TASK" \
+  -v issue_number="$ISSUE_NUMBER" \
+  -v issue_url="$ISSUE_URL" \
+  -v issue_reference="$ISSUE_REFERENCE" \
+  'BEGIN {
+    gsub(/&/, "\\\\&", repo)
+    gsub(/&/, "\\\\&", branch)
+    gsub(/&/, "\\\\&", run_id)
+    gsub(/&/, "\\\\&", user_task)
+    gsub(/&/, "\\\\&", issue_number)
+    gsub(/&/, "\\\\&", issue_url)
+    gsub(/&/, "\\\\&", issue_reference)
+  }
+  {
+    gsub(/\{\{REPO\}\}/, repo)
+    gsub(/\{\{BRANCH_NAME\}\}/, branch)
+    gsub(/\{\{RUN_ID\}\}/, run_id)
+    gsub(/\{\{USER_TASK\}\}/, user_task)
+    gsub(/\{\{ISSUE_NUMBER\}\}/, issue_number)
+    gsub(/\{\{ISSUE_URL\}\}/, issue_url)
+    gsub(/\{\{ISSUE_REFERENCE\}\}/, issue_reference)
+    print
+  }' "$TEMPLATE_FILE")
+
 log "Running Claude Code task..."
 log "Session will be saved to /sessions/$RUN_ID.json"
 
 
 # Run Claude Code — capture full stream-json output as the session record
-claude -p "$TASK" \
-  --allowedTools "Read,Write,Edit,Bash" \
+claude -p "$EFFECTIVE_TASK" \
+  --settings "$CLAUDE_SETTINGS_FILE" \
+  --allowedTools "$CLAUDE_ALLOWED_TOOLS" \
   --output-format stream-json \
   --verbose \
   2>&1 | tee "$SESSION_JSON" | tee -a "$LOG_FILE"
@@ -142,104 +219,16 @@ EOF
 
 log "Session summary written to /sessions/$RUN_ID.md"
 
-# Stage all changes: new files, modifications, and deletions
-log "Staging all changes..."
-git add -A 2>&1 | tee -a "$LOG_FILE"
-
-# Log what is staged
-STAGED_FILES=$(git diff --staged --name-status 2>/dev/null || echo "none")
-log "Staged files:"
-echo "$STAGED_FILES" | tee -a "$LOG_FILE"
-
-if [ -z "$STAGED_FILES" ] || [ "$STAGED_FILES" = "none" ]; then
-  log "Nothing to commit. Exiting."
-  exit 0
-fi
-
-# Build a commit subject from the first 72 characters of the task
-TASK_SUMMARY=$(echo "$TASK" | head -c 72 | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-
-# Commit with a summary subject and full task in the body
-log "Committing changes..."
-git commit -m "feat: $TASK_SUMMARY
-
-Task: $TASK
-
-Run ID: $RUN_ID
-Session: .claude-sessions/$RUN_ID.json
-Branch: $BRANCH_NAME
-Cost: \$$COST
-
-Automated by Claude Code" 2>&1 | tee -a "$LOG_FILE"
-
-log "Pushing branch $BRANCH_NAME..."
-git push origin "$BRANCH_NAME" 2>&1 | tee -a "$LOG_FILE"
-
-# Detect default branch
-DEFAULT_BRANCH=$(git remote show origin 2>/dev/null | grep 'HEAD branch' | awk '{print $NF}')
-DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
-
-# Create pull request via GitHub API
-log "Creating pull request..."
-PR_TITLE="feat: $TASK_SUMMARY"
-
-CHANGED_FILES=$(git diff --name-only "origin/$DEFAULT_BRANCH...HEAD" 2>/dev/null || echo "none")
-
-PR_BODY_FILE=$(mktemp)
-cat > "$PR_BODY_FILE" << EOF
-## Task
-
-$TASK
-
-## Run Info
-
-| Field | Value |
-|---|---|
-| Run ID | \`$RUN_ID\` |
-| Branch | \`$BRANCH_NAME\` |
-| Turns | $TURNS |
-| Duration | ${DURATION}ms |
-| Cost | \$$COST |
-
-## Files Changed
-
-\`\`\`
-$CHANGED_FILES
-\`\`\`
-
----
-*Automated by Claude Code — session transcript: \`$RUN_ID.json\`*
-EOF
-
-PR_PAYLOAD=$(jq -n \
-  --arg title "$PR_TITLE" \
-  --rawfile body "$PR_BODY_FILE" \
-  --arg head "$BRANCH_NAME" \
-  --arg base "$DEFAULT_BRANCH" \
-  '{title: $title, body: $body, head: $head, base: $base}')
-rm -f "$PR_BODY_FILE"
-
-log "Sending PR payload to GitHub API..."
-PR_RESPONSE=$(curl -s -X POST \
-  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-  -H "Accept: application/vnd.github+json" \
-  -H "X-GitHub-Api-Version: 2022-11-28" \
-  "https://api.github.com/repos/${REPO}/pulls" \
-  -d "$PR_PAYLOAD" \
-  2>>"$LOG_FILE")
-log "GitHub API response: $PR_RESPONSE"
-
-PR_URL=$(echo "$PR_RESPONSE" | jq -r '.html_url // empty')
-
+PR_URL=$(grep -Eo 'https://github\.com/[^[:space:]]+/pull/[0-9]+' "$SESSION_JSON" | tail -1 || true)
 if [ -n "$PR_URL" ]; then
-  log "Pull request created: $PR_URL"
+  log "Pull request reported by Claude: $PR_URL"
 else
-  log "WARNING: Failed to create pull request. Response: $PR_RESPONSE"
+  log "No pull request URL detected in session output."
 fi
 
 log "=== Done ==="
-log "Branch pushed:   $BRANCH_NAME"
-log "Pull request:    ${PR_URL:-"(not created)"}"
+log "Branch:          $BRANCH_NAME"
+log "Pull request:    ${PR_URL:-"(not detected)"}"
 log "Session JSON:    /sessions/$RUN_ID.json"
 log "Session summary: /sessions/$RUN_ID.md"
 log "Container log:   $LOG_FILE"
